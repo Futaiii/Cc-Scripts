@@ -49,10 +49,21 @@ var (
 	decodeMap   map[uint32]byte // 解码映射表
 	config      Config          // 全局配置
 	logger      *log.Logger     // 日志记录器
+	paddingPool []byte          // 全局填充池，用于扩展byte指纹
 )
 
 func init() {
 	logger = log.New(os.Stdout, "", log.LstdFlags|log.Lshortfile)
+
+	// 初始化填充池
+	// 目标：将payload的byte种类从67扩展到~96，同时保持低bit熵(平均~3.0)
+	// 0x80-0x8F (16个): 1000xxxx, 满足 (b & 0x90) != 0
+	// 0x10-0x1F (16个): 0001xxxx, 满足 (b & 0x90) != 0
+	paddingPool = make([]byte, 0, 32)
+	for i := 0; i < 16; i++ {
+		paddingPool = append(paddingPool, byte(0x80+i))
+		paddingPool = append(paddingPool, byte(0x10+i))
+	}
 }
 
 // ==========================================
@@ -286,13 +297,14 @@ func (sc *SudokuConn) Write(p []byte) (n int, err error) {
 	outCapacity := len(p) * 6
 	out := make([]byte, 0, outCapacity)
 
-	pads := []byte{0x80, 0x10, 0x90} // 用作填充的无效提示
+	pads := paddingPool // 用作填充的无效提示 (使用扩展的32种填充池)
+	padLen := len(pads) // 32
 
 	for _, b := range p {
 		// 字节前随机填充
 		// 使用本地随机数生成器速度快
 		if sc.rng.Float32() < sc.paddingRate {
-			out = append(out, pads[sc.rng.Intn(3)])
+			out = append(out, pads[sc.rng.Intn(padLen)])
 		}
 
 		puzzles := encodeTable[b]
@@ -306,7 +318,7 @@ func (sc *SudokuConn) Write(p []byte) (n int, err error) {
 		for _, idx := range perm {
 			// 提示组内的内部填充
 			if sc.rng.Float32() < sc.paddingRate {
-				out = append(out, pads[sc.rng.Intn(3)])
+				out = append(out, pads[sc.rng.Intn(padLen)])
 			}
 			out = append(out, puzzle[idx])
 		}
@@ -314,7 +326,7 @@ func (sc *SudokuConn) Write(p []byte) (n int, err error) {
 
 	// 尾部填充
 	if sc.rng.Float32() < sc.paddingRate {
-		out = append(out, pads[sc.rng.Intn(3)])
+		out = append(out, pads[sc.rng.Intn(padLen)])
 	}
 
 	_, err = sc.Conn.Write(out)

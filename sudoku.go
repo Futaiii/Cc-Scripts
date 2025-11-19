@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
 	crand "crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
@@ -16,36 +19,50 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"golang.org/x/crypto/chacha20poly1305"
 )
 
 // ==========================================
-// 1. Config
+// 1. 配置与日志
 // ==========================================
 
 type Config struct {
-	Mode          string `json:"mode"`
-	LocalPort     int    `json:"local_port"`
-	ServerAddress string `json:"server_address"`
-	FallbackAddr  string `json:"fallback_address"` // 新增：回落地址
-	Key           string `json:"key"`
+	Mode             string `json:"mode"`              // 运行模式："client" 或 "server"
+	LocalPort        int    `json:"local_port"`        // 本地监听端口，如 1080
+	ServerAddress    string `json:"server_address"`    // 服务器地址，如 "1.2.3.4:8080"
+	FallbackAddr     string `json:"fallback_address"`  // 回落地址，如 "127.0.0.1:80"
+	Key              string `json:"key"`               // 协议密钥
+	AEAD             string `json:"aead"`              // 加密方式："aes-128-gcm", "chacha20-poly1305", "none"
+	SuspiciousAction string `json:"suspicious_action"` // 可疑行为处理："fallback"(回落) 或 "silent"(静默)
+	PaddingMin       int    `json:"padding_min"`       // 最小填充百分比 (0-100)
+	PaddingMax       int    `json:"padding_max"`       // 最大填充百分比 (0-100)
 }
 
 const (
-	HandshakeTimeout = 10 * time.Second // 握手必须快，否则回落
+	HandshakeTimeout = 5 * time.Second // 握手超时时间
+	IOBufferSize     = 32 * 1024       // IO缓冲区大小：32KB，用于提高吞吐量
 )
 
 var (
-	encodeTable [256][][4]byte
-	decodeMap   map[uint32]byte
-	config      Config
+	encodeTable [256][][4]byte  // 编码表
+	decodeMap   map[uint32]byte // 解码映射表
+	config      Config          // 全局配置
+	logger      *log.Logger     // 日志记录器
 )
 
+func init() {
+	logger = log.New(os.Stdout, "", log.LstdFlags|log.Lshortfile)
+}
+
 // ==========================================
-// 2. Sudoku Engine (O(1) Pre-computation)
+// 2. 数独引擎（O(1)混淆）
 // ==========================================
 
+// Grid 表示一个4x4数独网格
 type Grid [16]uint8
 
+// generateAllGrids 生成所有有效的4x4数独网格
 func generateAllGrids() []Grid {
 	var grids []Grid
 	var g Grid
@@ -61,14 +78,16 @@ func generateAllGrids() []Grid {
 			valid := true
 			for i := 0; i < 4; i++ {
 				if g[row*4+i] == num || g[i*4+col] == num {
-					valid = false; break
+					valid = false
+					break
 				}
 			}
 			if valid {
 				for r := 0; r < 2; r++ {
 					for c := 0; c < 2; c++ {
 						if g[(br+r)*4+(bc+c)] == num {
-							valid = false; break
+							valid = false
+							break
 						}
 					}
 				}
@@ -84,16 +103,16 @@ func generateAllGrids() []Grid {
 	return grids
 }
 
+// initTables 初始化编码和解码表
 func initTables(key string) {
 	start := time.Now()
-	// ... (Engine logic same as before)
 	allGrids := generateAllGrids()
-	
+
 	h := sha256.New()
 	h.Write([]byte(key))
 	seed := int64(binary.BigEndian.Uint64(h.Sum(nil)[:8]))
 	rng := mrand.New(mrand.NewSource(seed))
-	
+
 	shuffledGrids := make([]Grid, 288)
 	copy(shuffledGrids, allGrids)
 	rng.Shuffle(len(shuffledGrids), func(i, j int) {
@@ -101,8 +120,7 @@ func initTables(key string) {
 	})
 
 	decodeMap = make(map[uint32]byte)
-	
-	// Precompute combinations C(16,4)
+
 	var combinations [][]int
 	var combine func(int, int, []int)
 	combine = func(s, k int, c []int) {
@@ -124,25 +142,28 @@ func initTables(key string) {
 		targetGrid := shuffledGrids[byteVal]
 		for _, positions := range combinations {
 			var currentHints [4]byte
-			// 我们只存储核心信息：Pos(4bit) 和 Val-1(2bit)
-			// 实际网络传输时会填充随机噪声
 			for i, pos := range positions {
 				val := targetGrid[pos]
-				// 存储格式：High 4 = Pos, Low 4 = Val-1 (Bit 2,3 are 0 for now)
-				currentHints[i] = byte((uint8(pos) << 4) | (val - 1))
+				hint := byte(((val - 1) << 5) | (uint8(pos) & 0x0F))
+				currentHints[i] = hint
 			}
 
 			matchCount := 0
 			for _, g := range allGrids {
 				match := true
 				for _, h := range currentHints {
-					pos := h >> 4
-					val := (h & 0x0F) + 1
-					if g[pos] != val { match = false; break }
+					pos := h & 0x0F
+					val := ((h >> 5) & 0x03) + 1
+					if g[pos] != val {
+						match = false
+						break
+					}
 				}
 				if match {
 					matchCount++
-					if matchCount > 1 { break }
+					if matchCount > 1 {
+						break
+					}
 				}
 			}
 
@@ -153,348 +174,609 @@ func initTables(key string) {
 			}
 		}
 	}
-	log.Printf("Tables initialized in %v", time.Since(start))
+	logger.Printf("[Init] Sudoku Tables initialized in %v. Cipher: %s", time.Since(start), config.AEAD)
 }
 
+// packHintsToKey 将提示打包成键值
 func packHintsToKey(hints [4]byte) uint32 {
-	// 解码时，我们只关心 High 4 bits (Pos) 和 Low 2 bits (Val)
-	// 中间的 Bits 2,3 是噪声，必须清洗掉
 	cleanHints := [4]byte{}
 	for i, h := range hints {
-		pos := h & 0xF0
-		val := h & 0x03 // 清洗噪声，只留最低2位
-		cleanHints[i] = pos | val
+		cleanHints[i] = h & 0x6F
 	}
-	
-	// 排序
 	s := cleanHints[:]
 	sort.Slice(s, func(i, j int) bool {
-		return (s[i] >> 4) < (s[j] >> 4)
+		return (s[i] & 0x0F) < (s[j] & 0x0F)
 	})
 	return binary.BigEndian.Uint32(s)
 }
 
 // ==========================================
-// 3. Protocol Layer with Noise Injection
+// 3. 传输层
 // ==========================================
 
+// SudokuConn 是对net.Conn的封装，提供数独混淆功能
 type SudokuConn struct {
-	net.Conn
-	readBuf bytes.Buffer
-	tmpBuf  []byte
+	net.Conn                 // 底层连接
+	reader     *bufio.Reader // 读取缓冲区
+	recorder   *bytes.Buffer // 记录器，用于记录握手阶段的数据
+	recording  bool          // 是否正在记录
+	recordLock sync.Mutex    // 记录锁
+
+	// 读取状态
+	rawBuf      []byte // 从网络读取的原始数据缓冲区
+	pendingData []byte // 已解码但尚未被消费的数据
+	hintBuf     []byte // 存储不完整提示的临时缓冲区
+
+	// 写入状态
+	rng         *mrand.Rand // 每个连接的本地随机数生成器
+	paddingRate float32     // 此连接的目标填充率
 }
 
-func NewSudokuConn(c net.Conn) *SudokuConn {
-	return &SudokuConn{Conn: c, tmpBuf: make([]byte, 4096)}
-}
+// NewSudokuConn 创建一个新的SudokuConn
+func NewSudokuConn(c net.Conn, record bool) *SudokuConn {
 
-func (sc *SudokuConn) Write(p []byte) (n int, err error) {
-	if len(p) == 0 { return 0, nil }
-	out := make([]byte, 0, len(p)*4)
-	
-	for _, b := range p {
-		puzzles := encodeTable[b]
-		if len(puzzles) == 0 { return 0, errors.New("table miss") }
-		
-		// 2. O(1) 随机选择一个谜题用于混淆
-		// 使用 fast rand (math/rand is fine for obfuscation selection)
-		puzzle := puzzles[mrand.Intn(len(puzzles))]
-		
-		// 3. 混淆 Hint 顺序 (可选)
-		// 虽然 Puzzle 是一组集合，但为了让网络流量看起来更随机，我们打乱发送这4个Hint的顺序
-		// Decoder 会重新排序，所以这里乱序是安全的
-		perm := mrand.Perm(4)
-		for _, idx := range perm {
-			out = append(out, puzzle[idx])
-		}	
-		/* ====下面是防止深度包检测的算法，暂不启用=====
-
-		// 构造带噪声的谜题
-		// basePuzzle[i] 格式: [Pos 4bit] [00] [Val 2bit]
-		// 我们要在中间的 [00] 填入随机位
-		// var noisyPuzzle [4]byte
-		// for i, h := range basePuzzle {
-		// 	// 生成 2 bit 随机噪声 (0-3) << 2
-		// 	noise := byte(mrand.Intn(4)) << 2
-		// 	noisyPuzzle[i] = h | noise 
-		// }
-
-		// 乱序发送 Hints
-		// perm := mrand.Perm(4)
-		// for _, idx := range perm {
-		// 	out = append(out, noisyPuzzle[idx])
-		// }
-
-		========================================*/
+	var seedBytes [8]byte
+	if _, err := crand.Read(seedBytes[:]); err != nil {
+		// 极端情况降级为时间种子
+		binary.BigEndian.PutUint64(seedBytes[:], uint64(time.Now().UnixNano()))
 	}
+	seed := int64(binary.BigEndian.Uint64(seedBytes[:]))
+	localRng := mrand.New(mrand.NewSource(seed))
+
+	pMin := float32(config.PaddingMin) / 100.0
+	pRange := float32(config.PaddingMax-config.PaddingMin) / 100.0
+	pRate := pMin + localRng.Float32()*pRange
+
+	sc := &SudokuConn{
+		Conn:        c,
+		reader:      bufio.NewReaderSize(c, IOBufferSize),
+		rawBuf:      make([]byte, IOBufferSize),
+		pendingData: make([]byte, 0, 4096),
+		hintBuf:     make([]byte, 0, 4),
+		rng:         localRng,
+		paddingRate: pRate,
+	}
+	if record {
+		sc.recorder = new(bytes.Buffer)
+		sc.recording = true
+	}
+	return sc
+}
+
+// StopRecording 停止记录并释放内存
+func (sc *SudokuConn) StopRecording() {
+	sc.recordLock.Lock()
+	sc.recording = false
+	sc.recorder = nil
+	sc.recordLock.Unlock()
+}
+
+// GetBufferedAndRecorded 返回已记录和缓冲的数据
+// 对于回落逻辑确保不丢失数据至关重要
+func (sc *SudokuConn) GetBufferedAndRecorded() []byte {
+	sc.recordLock.Lock()
+	defer sc.recordLock.Unlock()
+
+	var recorded []byte
+	if sc.recorder != nil {
+		recorded = sc.recorder.Bytes()
+	}
+
+	// 检查bufio中缓存的内容
+	buffered := sc.reader.Buffered()
+	if buffered > 0 {
+		peeked, _ := sc.reader.Peek(buffered)
+		// 合并已记录和缓冲的数据
+		full := make([]byte, len(recorded)+len(peeked))
+		copy(full, recorded)
+		copy(full[len(recorded):], peeked)
+		return full
+	}
+	return recorded
+}
+
+// Write 通过减少分配和使用块逻辑优化写入性能
+func (sc *SudokuConn) Write(p []byte) (n int, err error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+
+	// 预分配输出缓冲区
+	// 估计：len*4（提示）+ 填充。6倍的安全系数可覆盖50%的填充
+	outCapacity := len(p) * 6
+	out := make([]byte, 0, outCapacity)
+
+	pads := []byte{0x80, 0x10, 0x90} // 用作填充的无效提示
+
+	for _, b := range p {
+		// 字节前随机填充
+		// 使用本地随机数生成器速度快
+		if sc.rng.Float32() < sc.paddingRate {
+			out = append(out, pads[sc.rng.Intn(3)])
+		}
+
+		puzzles := encodeTable[b]
+		puzzle := puzzles[sc.rng.Intn(len(puzzles))]
+
+		// 打乱提示顺序（内联Fisher-Yates算法提高速度）
+		// 由于是4个元素的数组，我们可以简单地手动循环
+		perm := []int{0, 1, 2, 3}
+		sc.rng.Shuffle(4, func(i, j int) { perm[i], perm[j] = perm[j], perm[i] })
+
+		for _, idx := range perm {
+			// 提示组内的内部填充
+			if sc.rng.Float32() < sc.paddingRate {
+				out = append(out, pads[sc.rng.Intn(3)])
+			}
+			out = append(out, puzzle[idx])
+		}
+	}
+
+	// 尾部填充
+	if sc.rng.Float32() < sc.paddingRate {
+		out = append(out, pads[sc.rng.Intn(3)])
+	}
+
 	_, err = sc.Conn.Write(out)
+	// 根据io.Writer契约返回原始长度
 	return len(p), err
 }
 
+// Read 优化块读取而非逐字节读取
 func (sc *SudokuConn) Read(p []byte) (n int, err error) {
-	// 这里的 Read 逻辑需要配合 Fallback。
-	// 如果解码失败，我们不能简单的 return error，
-	// 而是应该让上层知道“这不是数独流量”。
-	// 但为了接口兼容，这里如果是标准 SudokuConn 使用，还是返回 error。
-	// Fallback 的探测逻辑会在 handleServerConnection 中手动处理。
-	
-	if sc.readBuf.Len() >= 4 { return sc.decodeNext(p) }
-	
-	rn, rerr := sc.Conn.Read(sc.tmpBuf)
-	if rn > 0 { sc.readBuf.Write(sc.tmpBuf[:rn]) }
-	
-	if sc.readBuf.Len() >= 4 { return sc.decodeNext(p) }
-	if rerr != nil { return 0, rerr }
-	
-	return sc.Read(p)
-}
-
-func (sc *SudokuConn) decodeNext(p []byte) (int, error) {
-	total := 0
-	for total < len(p) && sc.readBuf.Len() >= 4 {
-		chunk := sc.readBuf.Next(4)
-		var hints [4]byte
-		copy(hints[:], chunk)
-		
-		// packHintsToKey 会自动忽略 Bit 2/3 的噪声
-		key := packHintsToKey(hints)
-		
-		val, ok := decodeMap[key]
-		if !ok {
-			return total, errors.New("INVALID_SUDOKU")
-		}
-		p[total] = val
-		total++
-	}
-	return total, nil
-}
-
-// ==========================================
-// 4. Anti-Replay & Handshake
-// ==========================================
-
-var (
-	nonceCache = make(map[string]int64)
-	cacheLock  sync.Mutex
-)
-
-func cleanupCache() {
-	for {
-		time.Sleep(1 * time.Minute)
-		now := time.Now().Unix()
-		cacheLock.Lock()
-		for k, ts := range nonceCache {
-			if now-ts > 90 { delete(nonceCache, k) }
-		}
-		cacheLock.Unlock()
-	}
-}
-
-// ==========================================
-// 5. SOCKS5 & Fallback Logic
-// ==========================================
-
-// 将流量转发到 Fallback 地址 (Nginx)
-func forwardToFallback(badData []byte, src net.Conn, fallbackAddr string) {
-	if fallbackAddr == "" {
-		src.Close()
-		return
-	}
-	
-	log.Printf("[Fallback] Redirecting suspicious traffic from %s to %s", src.RemoteAddr(), fallbackAddr)
-	
-	dst, err := net.Dial("tcp", fallbackAddr)
-	if err != nil {
-		log.Printf("[Fallback] Failed to dial fallback: %v", err)
-		src.Close()
-		return
-	}
-	defer dst.Close()
-	defer src.Close()
-	
-	// 1. 先把已经读出来的“脏数据”（导致数独解码失败的数据）发给 Nginx
-	if len(badData) > 0 {
-		dst.Write(badData)
-	}
-	
-	// 2. 管道双向转发剩余流量
-	go io.Copy(dst, src)
-	io.Copy(src, dst)
-}
-
-// 服务端核心处理逻辑
-func handleServerConnection(rawConn net.Conn) {
-	// 设定一个较短的读取超时，防止 DoS
-	rawConn.SetReadDeadline(time.Now().Add(HandshakeTimeout))
-	
-	// 我们需要“偷看”一下数据，来决定是 Fallback 还是 处理 Sudoku
-	// 握手包大小 = 16 bytes (App layer) * 4 (Encoding) = 64 bytes
-	// 我们尝试读取 64 字节
-	
-	headerBuf := make([]byte, 64)
-	n, err := io.ReadFull(rawConn, headerBuf)
-	
-	// 恢复 Timeout
-	rawConn.SetReadDeadline(time.Time{})
-	
-	if err != nil {
-		// 连 64 字节都读不够，或者是 EOF，直接关掉或回落
-		if n > 0 {
-			forwardToFallback(headerBuf[:n], rawConn, config.FallbackAddr)
+	// 1. 如果有待处理的解码数据，则立即返回
+	if len(sc.pendingData) > 0 {
+		n = copy(p, sc.pendingData)
+		// 移动pendingData
+		// 如果为空，重置切片为0以重用底层数组
+		if n == len(sc.pendingData) {
+			sc.pendingData = sc.pendingData[:0]
 		} else {
-			rawConn.Close()
+			sc.pendingData = sc.pendingData[n:]
 		}
+		return n, nil
+	}
+
+	// 2. 从网络读取一块数据
+	// 我们持续读取直到产生至少1字节的输出或遇到错误
+	for {
+		// 如果pendingData在上一次循环迭代中被填充
+		if len(sc.pendingData) > 0 {
+			break
+		}
+
+		nr, rErr := sc.reader.Read(sc.rawBuf)
+		if nr > 0 {
+			chunk := sc.rawBuf[:nr]
+
+			// 记录（复制逻辑以避免长时间持有锁）
+			sc.recordLock.Lock()
+			if sc.recording {
+				sc.recorder.Write(chunk)
+			}
+			sc.recordLock.Unlock()
+
+			// 处理数据块
+			for _, b := range chunk {
+				// 过滤填充：有效提示位7和4为0。填充有1。
+				// 掩码0x90 (10010000)。如果结果!=0，则为填充
+				if (b & 0x90) != 0 {
+					continue
+				}
+
+				sc.hintBuf = append(sc.hintBuf, b)
+				if len(sc.hintBuf) == 4 {
+					key := packHintsToKey([4]byte{sc.hintBuf[0], sc.hintBuf[1], sc.hintBuf[2], sc.hintBuf[3]})
+					val, ok := decodeMap[key]
+					if !ok {
+						return 0, errors.New("INVALID_SUDOKU_MAP_MISS")
+					}
+					sc.pendingData = append(sc.pendingData, val)
+					sc.hintBuf = sc.hintBuf[:0] // 重置长度，保持容量
+				}
+			}
+		}
+
+		if rErr != nil {
+			return 0, rErr
+		}
+
+		// 有数据，跳出循环返回数据
+		if len(sc.pendingData) > 0 {
+			break
+		}
+		// 否则继续循环从网络读取更多数据
+	}
+
+	n = copy(p, sc.pendingData)
+	if n == len(sc.pendingData) {
+		sc.pendingData = sc.pendingData[:0]
+	} else {
+		sc.pendingData = sc.pendingData[n:]
+	}
+	return n, nil
+}
+
+// ==========================================
+// 4. 加密层（AEAD）
+// ==========================================
+
+// CipherConn 是对net.Conn的封装，提供AEAD加密功能
+type CipherConn struct {
+	net.Conn               // 底层连接
+	aead      cipher.AEAD  // AEAD密码接口
+	readBuf   bytes.Buffer // 读取缓冲区
+	nonceSize int          // Nonce大小
+}
+
+// NewCipherConn 创建一个新的CipherConn
+func NewCipherConn(c net.Conn, key string, method string) (*CipherConn, error) {
+	if method == "none" {
+		return &CipherConn{Conn: c, aead: nil}, nil
+	}
+
+	h := sha256.New()
+	h.Write([]byte(key))
+	keyBytes := h.Sum(nil)
+
+	var aead cipher.AEAD
+	var err error
+
+	switch method {
+	case "aes-128-gcm":
+		block, _ := aes.NewCipher(keyBytes[:16])
+		aead, err = cipher.NewGCM(block)
+	case "chacha20-poly1305":
+		aead, err = chacha20poly1305.New(keyBytes)
+	default:
+		return nil, fmt.Errorf("unsupported cipher: %s", method)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return &CipherConn{
+		Conn:      c,
+		aead:      aead,
+		nonceSize: aead.NonceSize(),
+	}, nil
+}
+
+// Write 实现加密写入
+func (cc *CipherConn) Write(p []byte) (int, error) {
+	if cc.aead == nil {
+		return cc.Conn.Write(p)
+	}
+
+	maxPayload := 65535 - cc.nonceSize - cc.aead.Overhead()
+	totalWritten := 0
+
+	// 使用bytes.Buffer构建帧以确保对底层连接的原子写入
+	var frameBuf bytes.Buffer
+	header := make([]byte, 2)
+	nonce := make([]byte, cc.nonceSize)
+
+	for len(p) > 0 {
+		chunkSize := len(p)
+		if chunkSize > maxPayload {
+			chunkSize = maxPayload
+		}
+		chunk := p[:chunkSize]
+		p = p[chunkSize:]
+
+		if _, err := io.ReadFull(crand.Reader, nonce); err != nil {
+			return totalWritten, err
+		}
+
+		ciphertext := cc.aead.Seal(nil, nonce, chunk, nil)
+
+		frameLen := len(nonce) + len(ciphertext)
+		binary.BigEndian.PutUint16(header, uint16(frameLen))
+
+		frameBuf.Reset()
+		frameBuf.Write(header)
+		frameBuf.Write(nonce)
+		frameBuf.Write(ciphertext)
+
+		if _, err := cc.Conn.Write(frameBuf.Bytes()); err != nil {
+			return totalWritten, err
+		}
+		totalWritten += chunkSize
+	}
+	return totalWritten, nil
+}
+
+// Read 实现解密读取
+func (cc *CipherConn) Read(p []byte) (int, error) {
+	if cc.aead == nil {
+		return cc.Conn.Read(p)
+	}
+
+	if cc.readBuf.Len() > 0 {
+		return cc.readBuf.Read(p)
+	}
+
+	// 读取帧头（2字节）
+	header := make([]byte, 2)
+	if _, err := io.ReadFull(cc.Conn, header); err != nil {
+		return 0, err
+	}
+	frameLen := int(binary.BigEndian.Uint16(header))
+
+	// 读取帧体
+	body := make([]byte, frameLen)
+	if _, err := io.ReadFull(cc.Conn, body); err != nil {
+		return 0, err
+	}
+
+	if len(body) < cc.nonceSize {
+		return 0, errors.New("frame too short")
+	}
+	nonce := body[:cc.nonceSize]
+	ciphertext := body[cc.nonceSize:]
+
+	plaintext, err := cc.aead.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return 0, errors.New("decryption failed")
+	}
+
+	cc.readBuf.Write(plaintext)
+	return cc.readBuf.Read(p)
+}
+
+// ==========================================
+// 5. 连接逻辑
+// ==========================================
+
+// handleSuspicious 处理可疑连接，通过恢复缓冲数据实现回落
+func handleSuspicious(sConn *SudokuConn, rawConn net.Conn) {
+	action := config.SuspiciousAction
+	remoteAddr := rawConn.RemoteAddr().String()
+
+	if action == "silent" {
+		logger.Printf("[Silent] Suspicious %s. Tarpit.", remoteAddr)
+		io.Copy(io.Discard, rawConn)
+		time.Sleep(5 * time.Second)
+		rawConn.Close()
 		return
 	}
 
-	// 尝试解码这 64 字节
-	// 我们手动模拟 SudokuConn 的解码过程来验证
-	decodedHandshake := make([]byte, 16) // 64 / 4 = 16
-	
-	for i := 0; i < 16; i++ {
-		chunk := headerBuf[i*4 : (i+1)*4]
-		var hints [4]byte
-		copy(hints[:], chunk)
-		
-		key := packHintsToKey(hints)
-		val, ok := decodeMap[key]
-		if !ok {
-			// 解码失败！说明这不是数独协议，可能是探测包 (HTTP GET...)
-			forwardToFallback(headerBuf, rawConn, config.FallbackAddr)
+	if config.FallbackAddr == "" {
+		rawConn.Close()
+		return
+	}
+
+	logger.Printf("[Fallback] %s -> %s", remoteAddr, config.FallbackAddr)
+	dst, err := net.DialTimeout("tcp", config.FallbackAddr, 3*time.Second)
+	if err != nil {
+		rawConn.Close()
+		return
+	}
+
+	// 关键：获取在bufio中缓冲或记录的数据
+	badData := sConn.GetBufferedAndRecorded()
+
+	// 将不良数据转发到上游
+	if len(badData) > 0 {
+		if _, err := dst.Write(badData); err != nil {
+			dst.Close()
+			rawConn.Close()
 			return
 		}
-		decodedHandshake[i] = val
 	}
-	
-	// 解码成功，现在校验时间戳和Nonce (防重放)
-	ts := int64(binary.BigEndian.Uint64(decodedHandshake[:8]))
-	nonce := string(decodedHandshake[8:])
-	now := time.Now().Unix()
-	
-	if ts < now-60 || ts > now+60 {
-		log.Printf("[Security] Replay/Timeout: ts skew")
-		forwardToFallback(headerBuf, rawConn, config.FallbackAddr) // 即使是格式正确但重放的包，也回落，迷惑攻击者
-		return
-	}
-	
-	cacheLock.Lock()
-	if _, exists := nonceCache[nonce]; exists {
-		cacheLock.Unlock()
-		log.Printf("[Security] Replay Detected")
-		forwardToFallback(headerBuf, rawConn, config.FallbackAddr)
-		return
-	}
-	nonceCache[nonce] = ts
-	cacheLock.Unlock()
-	
-	// =====================================
-	// 验证通过！进入正式模式
-	// =====================================
-	
-	// 我们已经读了 64 字节的握手包，SOCKS5 数据在后面。
-	// 我们需要构造一个 SudokuConn，但这个 SudokuConn 不需要再处理握手包了。
-	// 且它只需要处理后续的数据。
-	
-	sConn := NewSudokuConn(rawConn)
-	// 把 rawConn 交给 SOCKS5 处理
-	handleSocks5(sConn)
+
+	// 启动全双工桥接
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// 客户端 -> 回落服务器
+	go func() {
+		defer wg.Done()
+		defer dst.Close() // 向上游发送FIN
+		io.Copy(dst, rawConn)
+	}()
+
+	// 回落服务器 -> 客户端
+	go func() {
+		defer wg.Done()
+		defer rawConn.Close() // 向客户端发送FIN
+		io.Copy(rawConn, dst)
+	}()
+
+	wg.Wait()
 }
 
+// handleServerConnection 处理服务器连接
+func handleServerConnection(rawConn net.Conn) {
+	// 1. 数独层
+	sConn := NewSudokuConn(rawConn, true)
+
+	// 2. 加密层
+	cConn, err := NewCipherConn(sConn, config.Key, config.AEAD)
+	if err != nil {
+		rawConn.Close()
+		return
+	}
+
+	// 3. 握手
+	handshakeBuf := make([]byte, 16)
+	rawConn.SetReadDeadline(time.Now().Add(HandshakeTimeout))
+	_, err = io.ReadFull(cConn, handshakeBuf)
+	rawConn.SetReadDeadline(time.Time{})
+
+	if err != nil {
+		logger.Printf("[Security] Handshake fail: %v", err)
+		// 触发回落
+		handleSuspicious(sConn, rawConn)
+		return
+	}
+
+	// 4. 验证时间戳
+	ts := int64(binary.BigEndian.Uint64(handshakeBuf[:8]))
+	if abs(time.Now().Unix()-ts) > 60 {
+		logger.Printf("[Security] Time skew/Replay")
+		handleSuspicious(sConn, rawConn)
+		return
+	}
+
+	sConn.StopRecording()
+	handleSocks5(cConn)
+}
+
+// abs 计算绝对值
+func abs(x int64) int64 {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
+// handleSocks5 处理SOCKS5协议
 func handleSocks5(conn net.Conn) {
 	defer conn.Close()
-	
-	// 标准 SOCKS5 实现 (同上个版本，略微精简)
-	buf := make([]byte, 262) // Enough for header
-	if _, err := io.ReadFull(conn, buf[:2]); err != nil { return }
-	
-	// VER, NMETHODS
-	if buf[0] != 0x05 { return }
+	buf := make([]byte, 262)
+
+	// 协商阶段
+	if _, err := io.ReadFull(conn, buf[:2]); err != nil {
+		return
+	}
+	if buf[0] != 0x05 {
+		return
+	}
 	nMethods := int(buf[1])
-	if _, err := io.ReadFull(conn, buf[:nMethods]); err != nil { return }
-	conn.Write([]byte{0x05, 0x00}) // No Auth
-	
-	// Request
-	if _, err := io.ReadFull(conn, buf[:4]); err != nil { return }
-	var target string
+	if _, err := io.ReadFull(conn, buf[:nMethods]); err != nil {
+		return
+	}
+	conn.Write([]byte{0x05, 0x00})
+
+	// 请求阶段
+	if _, err := io.ReadFull(conn, buf[:4]); err != nil {
+		return
+	}
+	if buf[1] != 0x01 {
+		return
+	} // 仅支持CONNECT方法
+
+	var destAddr string
 	switch buf[3] {
 	case 0x01: // IPv4
-		if _, err := io.ReadFull(conn, buf[:4]); err != nil { return }
-		target = net.IP(buf[:4]).String()
-	case 0x03: // Domain
-		if _, err := io.ReadFull(conn, buf[:1]); err != nil { return }
-		domainLen := int(buf[0])
-		if _, err := io.ReadFull(conn, buf[:domainLen]); err != nil { return }
-		target = string(buf[:domainLen])
-	case 0x04: // IPv6
-		if _, err := io.ReadFull(conn, buf[:16]); err != nil { return }
-		target = net.IP(buf[:16]).String()
+		if _, err := io.ReadFull(conn, buf[:4]); err != nil {
+			return
+		}
+		portBuf := make([]byte, 2)
+		if _, err := io.ReadFull(conn, portBuf); err != nil {
+			return
+		}
+		destAddr = fmt.Sprintf("%s:%d", net.IP(buf[:4]).String(), binary.BigEndian.Uint16(portBuf))
+	case 0x03: // 域名
+		if _, err := io.ReadFull(conn, buf[:1]); err != nil {
+			return
+		}
+		dLen := int(buf[0])
+		domainBuf := make([]byte, dLen)
+		if _, err := io.ReadFull(conn, domainBuf); err != nil {
+			return
+		}
+		portBuf := make([]byte, 2)
+		if _, err := io.ReadFull(conn, portBuf); err != nil {
+			return
+		}
+		destAddr = fmt.Sprintf("%s:%d", string(domainBuf), binary.BigEndian.Uint16(portBuf))
+	default:
+		return
 	}
-	
-	if _, err := io.ReadFull(conn, buf[:2]); err != nil { return }
-	port := binary.BigEndian.Uint16(buf[:2])
-	destAddr := fmt.Sprintf("%s:%d", target, port)
-	
-	dest, err := net.DialTimeout("tcp", destAddr, 5*time.Second)
-	if err != nil { return }
-	defer dest.Close()
-	conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0,0,0,0, 0,0})
-	
-	go io.Copy(dest, conn)
-	io.Copy(conn, dest)
+	logger.Printf("[SOCKS5] Connecting to %s", destAddr)
+	target, err := net.DialTimeout("tcp", destAddr, 10*time.Second)
+	if err != nil {
+		logger.Printf("[SOCKS5] Connect failed: %v", err)
+		return
+	}
+	defer target.Close()
+
+	conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+
+	// 数据桥接
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { io.Copy(target, conn); target.Close(); wg.Done() }()
+	go func() { io.Copy(conn, target); conn.Close(); wg.Done() }()
+	wg.Wait()
 }
 
 // ==========================================
-// 6. Client & Main
+// 6. 客户端/服务器主循环
 // ==========================================
 
+// runClient 运行客户端
 func runClient() {
 	l, err := net.Listen("tcp", fmt.Sprintf(":%d", config.LocalPort))
-	if err != nil { log.Fatal(err) }
-	log.Printf("Client on :%d", config.LocalPort)
-	
+	if err != nil {
+		logger.Fatal(err)
+	}
+	logger.Printf("Client on :%d -> %s", config.LocalPort, config.ServerAddress)
+
 	for {
 		c, err := l.Accept()
-		if err != nil { continue }
+		if err != nil {
+			continue
+		}
 		go func(local net.Conn) {
 			defer local.Close()
-			remote, err := net.Dial("tcp", config.ServerAddress)
-			if err != nil { return }
-			defer remote.Close()
-			
-			sConn := NewSudokuConn(remote)
-			
-			// 发送握手 (Client 不需要 Fallback)
+			remoteRaw, err := net.Dial("tcp", config.ServerAddress)
+			if err != nil {
+				return
+			}
+			defer remoteRaw.Close()
+
+			sConn := NewSudokuConn(remoteRaw, false)
+			cConn, err := NewCipherConn(sConn, config.Key, config.AEAD)
+			if err != nil {
+				return
+			}
+
 			handshake := make([]byte, 16)
 			binary.BigEndian.PutUint64(handshake[:8], uint64(time.Now().Unix()))
 			crand.Read(handshake[8:])
-			sConn.Write(handshake)
-			
-			go io.Copy(sConn, local)
-			io.Copy(local, sConn)
+			if _, err := cConn.Write(handshake); err != nil {
+				return
+			}
+
+			go io.Copy(cConn, local)
+			io.Copy(local, cConn)
 		}(c)
 	}
 }
 
+// runServer 运行服务器
 func runServer() {
 	l, err := net.Listen("tcp", fmt.Sprintf(":%d", config.LocalPort))
-	if err != nil { log.Fatal(err) }
-	log.Printf("Server on :%d (Fallback -> %s)", config.LocalPort, config.FallbackAddr)
-	go cleanupCache()
-	
+	if err != nil {
+		logger.Fatal(err)
+	}
+	logger.Printf("Server on :%d (Fallback: %s)", config.LocalPort, config.FallbackAddr)
+
 	for {
 		c, err := l.Accept()
-		if err != nil { continue }
+		if err != nil {
+			continue
+		}
 		go handleServerConnection(c)
 	}
 }
 
+// main 主函数
 func main() {
-	mrand.Seed(time.Now().UnixNano())
-	f, _ := os.Open("config.json")
-	json.NewDecoder(f).Decode(&config)
-	if config.Key == "" { log.Fatal("Key needed") }
+	f, err := os.Open("config.json")
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := json.NewDecoder(f).Decode(&config); err != nil {
+		log.Fatal(err)
+	}
+	f.Close()
+
 	initTables(config.Key)
-	
+
 	if config.Mode == "client" {
 		runClient()
 	} else {
